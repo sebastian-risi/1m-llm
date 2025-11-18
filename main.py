@@ -16,13 +16,13 @@ def main():
     parser.add_argument(
         '--grid_size',
         type=int,
-        default=5,
+        default=2,
         help='Size of the k x k grid (default: 5)'
     )
     parser.add_argument(
         '--iterations',
         type=int,
-        default=3,
+        default=20,
         help='Number of iterations to run (default: 3)'
     )
     parser.add_argument(
@@ -40,6 +40,7 @@ def main():
     parser.add_argument(
         '--visualize',
         action='store_true',
+        default=True,
         help='Show visualizations'
     )
     

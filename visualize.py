@@ -62,69 +62,118 @@ def visualize_circle_packing_solution(
     title: str = "Circle Packing Solution",
     save_path: Optional[str] = None,
     show: bool = True,
+    score: Optional[float] = None,
 ):
     """
-    Visualize a circle packing solution.
+    Visualize a circle packing solution with variable radii.
     
     Args:
         solution: String containing the solution
         title: Title for the plot
         save_path: Path to save the figure (optional)
         show: Whether to display the plot
+        score: Optional score to display in title
     """
     import re
     
-    # Extract coordinates
-    coords_pattern = r'\(([0-9.]+),\s*([0-9.]+)\)'
-    matches = re.findall(coords_pattern, solution)
+    circles = []
     
-    if not matches:
-        print("No valid coordinates found in solution")
+    # Try to parse format 1: [(x1, y1, r1), (x2, y2, r2), ...]
+    tuple_pattern = r'\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\)'
+    tuple_matches = re.findall(tuple_pattern, solution)
+    
+    if tuple_matches:
+        # Format 1: (x, y, r) tuples
+        for match in tuple_matches:
+            try:
+                x, y, r = float(match[0]), float(match[1]), float(match[2])
+                if r > 0 and 0 <= x <= 1 and 0 <= y <= 1:
+                    circles.append((x, y, r))
+            except ValueError:
+                continue
+    else:
+        # Try to parse format 2: Circle N: (x, y) radius: r
+        coords_pattern = r'\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\)'
+        coord_matches = list(re.finditer(coords_pattern, solution))
+        
+        for coord_match in coord_matches:
+            try:
+                x = float(coord_match.group(1))
+                y = float(coord_match.group(2))
+                
+                # Look for radius in the text after this coordinate
+                start_pos = coord_match.end()
+                radius_text = solution[start_pos:start_pos + 50]
+                
+                radius_patterns = [
+                    r'radius[:\s=]+\s*([0-9.]+)',
+                    r'r[:\s=]+\s*([0-9.]+)',
+                ]
+                
+                radius = None
+                for pattern in radius_patterns:
+                    radius_match = re.search(pattern, radius_text, re.IGNORECASE)
+                    if radius_match:
+                        radius = float(radius_match.group(1))
+                        break
+                
+                if radius is None:
+                    global_radius_match = re.search(r'radius[:\s=]+\s*([0-9.]+)', solution.lower())
+                    if global_radius_match:
+                        radius = float(global_radius_match.group(1))
+                
+                if radius is not None and radius > 0 and 0 <= x <= 1 and 0 <= y <= 1:
+                    circles.append((x, y, radius))
+            except (ValueError, IndexError):
+                continue
+    
+    if not circles:
+        print("No valid circles found in solution")
         return
     
-    circles = []
-    for match in matches:
-        x, y = float(match[0]), float(match[1])
-        if 0 <= x <= 1 and 0 <= y <= 1:
-            circles.append((x, y))
-    
-    # Extract radius
-    radius_pattern = r'radius[:\s=]+([0-9.]+)'
-    radius_match = re.search(radius_pattern, solution.lower())
-    if radius_match:
-        radius = float(radius_match.group(1))
-    else:
-        radius = 0.05  # Default
-    
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(10, 10))
     
     # Draw square boundary
-    square = patches.Rectangle((0, 0), 1, 1, linewidth=2, 
-                              edgecolor='black', facecolor='white')
+    square = patches.Rectangle((0, 0), 1, 1, linewidth=3, 
+                              edgecolor='black', facecolor='white', zorder=0)
     ax.add_patch(square)
     
-    # Draw circles
+    # Draw circles with variable radii
     colors = plt.cm.tab20(np.linspace(0, 1, len(circles)))
-    for i, (x, y) in enumerate(circles):
-        circle = patches.Circle((x, y), radius, linewidth=1,
-                               edgecolor='blue', facecolor=colors[i], alpha=0.6)
-        ax.add_patch(circle)
-        ax.plot(x, y, 'ro', markersize=3)  # Center point
+    sum_radii = 0.0
     
-    ax.set_xlim(-0.1, 1.1)
-    ax.set_ylim(-0.1, 1.1)
+    for i, (x, y, r) in enumerate(circles):
+        circle = patches.Circle((x, y), r, linewidth=1.5,
+                               edgecolor='darkblue', facecolor=colors[i], 
+                               alpha=0.7, zorder=1)
+        ax.add_patch(circle)
+        # Draw center point
+        ax.plot(x, y, 'ko', markersize=4, zorder=2)
+        # Label with circle number
+        ax.text(x, y, str(i+1), ha='center', va='center', 
+               fontsize=7, fontweight='bold', color='white', zorder=3)
+        sum_radii += r
+    
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
     ax.set_aspect('equal')
-    ax.set_title(f"{title}\n{len(circles)} circles, radius={radius:.3f}", 
-                fontsize=14, fontweight='bold')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.grid(True, alpha=0.3)
+    
+    # Build title
+    title_text = f"{title}\n{len(circles)} circles"
+    if score is not None:
+        title_text += f", Score (sum of radii): {score:.4f}"
+    title_text += f"\nSum of radii: {sum_radii:.4f}"
+    
+    ax.set_title(title_text, fontsize=12, fontweight='bold')
+    ax.set_xlabel('X', fontsize=11)
+    ax.set_ylabel('Y', fontsize=11)
+    ax.grid(True, alpha=0.2, linestyle='--')
     
     plt.tight_layout()
     
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved visualization to {save_path}")
+        print(f"Saved circle packing visualization to {save_path}")
     
     if show:
         plt.show()
@@ -160,7 +209,7 @@ def visualize_best_solutions(
     
     # Visualize top k
     for idx, (cell, score, (i, j)) in enumerate(cells_with_scores[:top_k]):
-        title = f"Best Solution #{idx+1} (Cell ({i}, {j}), Score: {score:.3f})"
+        title = f"Best Solution #{idx+1} (Cell ({i}, {j}))"
         save_path = None
         if save_dir:
             import os
@@ -172,5 +221,54 @@ def visualize_best_solutions(
             title=title,
             save_path=save_path,
             show=show,
+            score=score,
         )
+
+
+def visualize_best_solution(
+    grid,
+    iteration: int,
+    save_dir: Optional[str] = None,
+    show: bool = True,
+):
+    """
+    Visualize the single best solution from the grid.
+    
+    Args:
+        grid: CellularLLMGrid instance
+        iteration: Current iteration number
+        save_dir: Directory to save visualization (optional)
+        show: Whether to display plot
+    """
+    # Find the best solution
+    best_score = -1
+    best_cell = None
+    best_pos = None
+    
+    for i in range(grid.grid_size):
+        for j in range(grid.grid_size):
+            cell = grid.grid[i, j]
+            if cell.solution and cell.score > best_score:
+                best_score = cell.score
+                best_cell = cell
+                best_pos = (i, j)
+    
+    if best_cell is None:
+        print("No valid solution found to visualize")
+        return
+    
+    title = f"Best Circle Packing Solution - Iteration {iteration}\nCell ({best_pos[0]}, {best_pos[1]})"
+    save_path = None
+    if save_dir:
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"best_solution_iter_{iteration}.png")
+    
+    visualize_circle_packing_solution(
+        best_cell.solution,
+        title=title,
+        save_path=save_path,
+        show=show,
+        score=best_score,
+    )
 

@@ -3,11 +3,12 @@
 """
 A Thousand Self-Organizing LLMs: Cellular Automata with LLM Cells
 
-This version is modified for a "Color Consensus" task to prove the
-JAX-native parallel system works. The 1B model can easily handle this.
+This version implements a JAX-native parallel generation step
+using the 'transformers' library with its Flax (JAX) backend.
+There is no sequential fallback.
 
 Usage:
-    python main.py --grid_size 5 --iterations 10 --visualize
+    python main.py --grid_size 10 --iterations 5 --visualize
 """
 
 import jax
@@ -37,8 +38,9 @@ class CellState:
     position: Tuple[int, int]
     system_prompt: str
     conversation_history: List[Dict[str, str]]
-    solution: Optional[str] = None # This will now store the 'color'
+    solution: Optional[str] = None
     score: float = 0.0
+    # The 'sampler' object has been removed, as it's not JAX-compatible
 
 
 class CellularLLMGrid:
@@ -47,11 +49,16 @@ class CellularLLMGrid:
     def __init__(
         self,
         grid_size: int = 10,
-        task_description: str = "color_consensus", # Default to the new task
+        task_description: str = "circle_packing",
         model_id: str = "google/gemma-3-1b-it",
     ):
         """
         Initialize the cellular automata grid.
+        
+        Args:
+            grid_size: Size of the k x k grid
+            task_description: Description of the task to solve
+            model_id: The Hugging Face model ID for a Flax-compatible Gemma model
         """
         self.grid_size = grid_size
         self.task_description = task_description
@@ -77,9 +84,11 @@ class CellularLLMGrid:
         
         print("Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        # Set padding token for batching
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
+        # Handle multiple eos_token_ids - take the first one for generation
         if hasattr(model_stateful.config, 'eos_token_id'):
             if isinstance(model_stateful.config.eos_token_id, list):
                 self.eos_token_id = model_stateful.config.eos_token_id[0]
@@ -96,6 +105,8 @@ class CellularLLMGrid:
         # --- JIT-Compilation ---
         print("Compiling JAX parallel generation function (this may take a moment)...")
         
+        # This function is JIT-compiled. It takes the batched inputs
+        # and runs the model's 'generate' method in parallel.
         def _parallel_generate(
             params, 
             input_ids: jax.Array, 
@@ -110,14 +121,16 @@ class CellularLLMGrid:
                 params=params,
                 do_sample=True,
                 prng_key=prng_key,
-                max_new_tokens=10, # Very short, just need one word
+                max_new_tokens=300, # Max tokens for solution
                 temperature=0.7,
+                top_p=0.9,
                 top_k=50,
                 eos_token_id=eos_token_id,
-                pad_token_id=eos_token_id,
+                pad_token_id=eos_token_id, # Use EOS for padding
             ).sequences
             return output_sequences
             
+        # Store the compiled function with static_argnames
         self._jit_parallel_generate = jax.jit(_parallel_generate, static_argnames=['eos_token_id'])
         print("JAX function compiled.")
 
@@ -137,43 +150,40 @@ class CellularLLMGrid:
         return grid
     
     def _generate_system_prompt(self, i: int, j: int) -> str:
-        """Generate a unique system prompt for each cell (Color Consensus Task)"""
-        base_prompt = f"""You are a cell in a cellular automata system trying to reach a consensus.
+        """Generate a unique system prompt for each cell"""
+        # REMOVED example text to stop model from copying it
+        base_prompt = f"""You are an optimization agent in a cellular automata system solving circle packing.
 
 TASK: {self._get_task_description()}
 
 YOUR POSITION: Cell ({i}, {j}) in a {self.grid_size}x{self.grid_size} grid
 
 CRITICAL OUTPUT FORMAT:
-- You MUST output ONLY a single color.
-- Choose one of: red, green, blue, yellow
+- You MUST output ONLY a Python list of 26 tuples.
+- The format must be: [(x, y, r), (x, y, r), ...]
 - NO extra text, explanations, or commentary.
+- Start with '[' and end with ']'.
 
-You will receive your neighbors' colors and must try to match them."""
+You will receive neighbor solutions and must improve upon them."""
         
-        # Give some cells different starting preferences
-        variations = ["red", "green", "blue", "yellow"]
-        initial_preference = variations[(i * self.grid_size + j) % len(variations)]
+        variations = [
+            "Try larger radii.", "Focus on efficient packing.", "Minimize wasted space."
+        ]
+        variation = variations[(i * self.grid_size + j) % len(variations)]
         
-        return f"{base_prompt}\n\nYour initial preference is {initial_preference}."
-
+        return f"{base_prompt}\n\n{variation}"
+    
     def _get_task_description(self) -> str:
         """Get the task description"""
-        if self.task_description == "color_consensus":
-            return """COLOR CONSENSUS PROBLEM:
-The entire grid must agree on a single color.
-Your neighbors will tell you their color.
-Your score is based on how many neighbors you agree with.
-Output ONLY one color: red, green, blue, or yellow.
-"""
-        elif self.task_description == "circle_packing":
-            # This is the original, complex task
+        # REMOVED example text to stop model from copying it
+        if self.task_description == "circle_packing":
             return """CIRCLE PACKING PROBLEM:
 Given a square of side length 1, place exactly 26 circles such that:
 - The sum of their radii is maximized
 - No circles overlap
 - All circles are completely inside the square
 - Each circle can have a different radius
+
 Provide your solution as a list of circles with their centers and radii in the format:
 [(x1, y1, r1), (x2, y2, r2), ..., (x26, y26, r26)]
 """
@@ -182,46 +192,16 @@ Provide your solution as a list of circles with their centers and radii in the f
     
     def _get_evaluator(self, task: str):
         """Get the evaluation function for the task"""
-        if task == "color_consensus":
-            # Note: The real evaluation logic is now in _update_grid_state
-            # because it requires neighbor info.
-            return self._evaluate_color_consensus
-        elif task == "circle_packing":
+        if task == "circle_packing":
             return self._evaluate_circle_packing
         else:
             return lambda solution_str: 0.0
-
-    def _parse_color(self, solution: str) -> Optional[str]:
-        """Helper to parse color from model output."""
-        if not solution: return None
-        solution = solution.lower().strip().replace(".", "")
-        if "red" in solution: return "red"
-        if "green" in solution: return "green"
-        if "blue" in solution: return "blue"
-        if "yellow" in solution: return "yellow"
-        return None
-
-    def _evaluate_color_consensus(self, solution: str, neighbor_solutions: List[str]) -> float:
-        """
-        Evaluates color consensus.
-        The score is the number of neighbors this cell agrees with.
-        """
-        my_color = self._parse_color(solution)
-        if my_color is None:
-            return 0.0 # No valid color, no score
-        
-        score = 0
-        for neighbor_sol in neighbor_solutions:
-            neighbor_color = self._parse_color(neighbor_sol)
-            if my_color == neighbor_color:
-                score += 1
-        
-        return float(score)
-
+    
     def _evaluate_circle_packing(self, solution: str) -> float:
         """Evaluate a circle packing solution."""
         if not solution: return 0.0
         try:
+            # Parse circles with format (x, y, radius)
             coords_pattern = r'\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\)'
             matches = re.findall(coords_pattern, solution)
             if not matches: return 0.0
@@ -232,10 +212,13 @@ Provide your solution as a list of circles with their centers and radii in the f
                     x, y, r = float(match[0]), float(match[1]), float(match[2])
                     if 0 <= x <= 1 and 0 <= y <= 1 and r > 0:
                         circles.append((x, y, r))
-                except ValueError: continue
+                except ValueError:
+                    continue
             
-            if len(circles) == 0: return 0.0
+            if len(circles) == 0:
+                return 0.0
             
+            # Penalize if not exactly 26 circles
             num_circles = len(circles)
             circle_count_penalty = 1.0 if num_circles == 26 else 0.5
             
@@ -252,6 +235,7 @@ Provide your solution as a list of circles with their centers and radii in the f
                             if dist < (r1 + r2) - 1e-6:
                                 valid = False
                                 break
+                
                 if valid:
                     total_radius_sum += r1
             
@@ -279,80 +263,98 @@ Provide your solution as a list of circles with their centers and radii in the f
         for ni, nj in neighbors:
             cell = self.grid[ni, nj]
             
-            if cell.solution:
-                messages.append(f"Neighbor ({ni}, {nj}) Score={cell.score:.0f}, Color: {cell.solution[:20]}")
+            # --- FEEDBACK LOOP FIX ---
+            # ONLY show the solution text if it's valid (score > 0).
+            # Otherwise, just report the score to avoid feeding garbage.
+            if cell.score > 0 and cell.solution:
+                messages.append(f"Neighbor ({ni}, {nj}) Score={cell.score:.2f}:\n{cell.solution[:150]}...")
             else:
-                messages.append(f"Neighbor ({ni}, {nj}): No color yet.")
+                # Don't show the garbage solution.
+                messages.append(f"Neighbor ({ni}, {nj}) Score: 0.0 (No valid solution yet)")
+            # --- END OF FIX ---
 
         if not messages:
             return "No messages from neighbors yet."
         
-        return "\n".join(messages)
+        return "\n\n".join(messages)
     
     def _format_history(self, history: List[Dict[str, str]], cell_score: float) -> str:
         """Format conversation history for prompt"""
         if not history: return "No previous attempts."
         
-        for msg in reversed(history):
-            if msg.get('role') == 'assistant':
-                return f"Your last choice (Score {cell_score:.0f}): {msg.get('content', '')}"
+        # --- FEEDBACK LOOP FIX ---
+        # Only show the previous solution if it had a positive score
+        if cell_score > 0:
+            for msg in reversed(history):
+                if msg.get('role') == 'assistant':
+                    return f"Your last solution (Score {cell_score:.2f}):\n{msg.get('content', '')[:500]}"
         
-        return "No previous attempts."
+        # If score is 0, don't show the bad solution
+        return "Your previous attempts scored 0."
+        # --- END OF FIX ---
 
     def _prepare_batched_inputs(self) -> Tuple[jax.Array, jax.Array, jax.Array]:
-        """
-        [PYTHON STEP]
-        Gathers all N prompts as strings, then tokenizes them into a
-        single batched JAX array.
-        Returns: (input_ids, attention_mask, prng_key)
-        """
-        N = self.grid_size * self.grid_size
-        full_prompts = []
+            """
+            [PYTHON STEP]
+            Gathers all N prompts as strings, then tokenizes them into a
+            single batched JAX array.
+            Returns: (input_ids, attention_mask, prng_key)
+            """
+            N = self.grid_size * self.grid_size
+            full_prompts = []
 
-        print("Preparing batched prompts...")
-        for i in range(self.grid_size):
-            for j in range(self.grid_size):
-                cell = self.grid[i, j]
-                
-                neighbor_messages = self._get_neighbor_messages(i, j)
-                history_text = self._format_history(cell.conversation_history, cell.score)
+            print("Preparing batched prompts...")
+            for i in range(self.grid_size):
+                for j in range(self.grid_size):
+                    cell = self.grid[i, j]
+                    
+                    neighbor_messages = self._get_neighbor_messages(i, j)
+                    history_text = self._format_history(cell.conversation_history, cell.score)
+                    
+                    # Construct the user message for this cell
+                    user_message = f"""NEIGHBOR MESSAGES (FROM PREVIOUS ITERATION):
+    {neighbor_messages}
 
-                # Construct the user message for this cell
-                user_message = f"""NEIGHBOR MESSAGES:
-{neighbor_messages}
+    YOUR PREVIOUS ATTEMPTS:
+    {history_text}
 
-YOUR PREVIOUS ATTEMPT:
-{history_text}
+    INSTRUCTION:
+    Provide an improved solution. Output ONLY the list of 26 circles.
+    Format: [(x, y, r), (x, y, r), ...]
+    Each circle must have: center coordinates (x, y) and radius r, all between 0 and 1.
+    No circles should overlap. All circles must be fully inside the unit square.
+    Maximize the sum of all radii.
 
-INSTRUCTION:
-Output ONLY one color: red, green, blue, or yellow."""
-                
-                # Use the chat template for proper formatting
-                messages = [
-                    {"role": "user", "content": f"{cell.system_prompt}\n\n{user_message}"}
-                ]
-                
-                formatted_prompt = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                full_prompts.append(formatted_prompt)
+    Start your response with '[' and output nothing else except the list."""
+                    
+                    # Use the chat template for proper formatting
+                    messages = [
+                        {"role": "user", "content": f"{cell.system_prompt}\n\n{user_message}"}
+                    ]
+                    
+                    formatted_prompt = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                    full_prompts.append(formatted_prompt)
 
-        # Tokenize the entire batch of N prompts
-        print(f"Tokenizing {N} prompts...")
-        inputs = self.tokenizer(
-            full_prompts,
-            return_tensors="jax",
-            padding="max_length", # Pad all to the same length
-            truncation=True,
-            max_length=512 # This is more than enough for this simple task
-        )
-        
-        # Create a unique RNG key for this generation step
-        self._master_key, gen_key = jax.random.split(self._master_key)
-        
-        return inputs['input_ids'], inputs['attention_mask'], gen_key
+            # Tokenize the entire batch of N prompts
+            print(f"Tokenizing {N} prompts...")
+            inputs = self.tokenizer(
+                full_prompts,
+                return_tensors="jax",
+                padding="max_length", # Pad all to the same length
+                truncation=True,
+                # --- THIS IS THE FIX ---
+                max_length=2048 # Increased from 1024
+                # --- END OF FIX ---
+            )
+            
+            # Create a unique RNG key for this generation step
+            self._master_key, gen_key = jax.random.split(self._master_key)
+            
+            return inputs['input_ids'], inputs['attention_mask'], gen_key
 
     def _run_parallel_generation(
         self, 
@@ -368,6 +370,7 @@ Output ONLY one color: red, green, blue, or yellow."""
         N = input_ids.shape[0]
         print(f"Running parallel JAX generation for {N} cells...")
         
+        # This calls the JIT-compiled function we created in __init__
         output_sequences = self._jit_parallel_generate(
             self.params,
             input_ids,
@@ -381,64 +384,80 @@ Output ONLY one color: red, green, blue, or yellow."""
     def _update_grid_state(self, output_sequences: jax.Array):
         """
         [PYTHON STEP]
-        De-tokenizes, evaluates, and updates the grid state.
-        This is now a 2-pass process for consensus task.
+        De-tokenizes the JAX array outputs back into strings,
+        evaluates them, and updates the Python grid state.
+        
+        Args:
+            output_sequences: The full sequences including input + generated tokens
         """
         N = output_sequences.shape[0]
         print(f"De-tokenizing and scoring {N} outputs...")
         
+        # Decode the FULL sequence, *keeping* special tokens
         full_response_texts = self.tokenizer.batch_decode(
             output_sequences, 
             skip_special_tokens=False
         )
+        
+        # This is the special string that marks the start of the model's answer
         generation_prompt = "<start_of_turn>model\n"
         
         flat_grid = self.grid.flatten()
-        raw_solutions = [""] * N # To store solutions for 2nd pass
-
-        # --- PASS 1: Get all solutions and update history ---
         for idx in range(N):
             cell = flat_grid[idx]
             full_text = full_response_texts[idx]
             
+            # Find the start of the model's *actual* answer
             start_gen_idx = full_text.rfind(generation_prompt)
+            
             if start_gen_idx != -1:
+                # Get just the model's part
                 response_text = full_text[start_gen_idx + len(generation_prompt):]
             else:
+                # Fallback: couldn't find the template
                 response_text = full_text
 
+            # Now, strip any special tokens (like <eos>)
             response_text = response_text.replace(self.tokenizer.eos_token, "").strip()
-            
-            # Save the raw text
-            raw_solutions[idx] = response_text
-            
-            # Update the cell's solution text and history
-            cell.solution = response_text
-            cell.conversation_history.append({'role': 'user', 'content': 'Provide your choice.'})
-            cell.conversation_history.append({'role': 'assistant', 'content': response_text})
 
-        # --- PASS 2: Evaluate scores based on neighbor solutions ---
-        print("Evaluating scores based on neighbors...")
-        for idx in range(N):
-            cell = flat_grid[idx]
-            my_solution = cell.solution
+            # Debug: Print first few responses to verify extraction
+            if idx < 3:
+                print(f"\nCell {idx} raw output (first 200 chars): {response_text[:200]}")
             
-            # Get this cell's neighbor indices
-            i, j = cell.position
-            neighbor_indices = []
-            for ni, nj in self._get_neighbors(i, j):
-                neighbor_indices.append(ni * self.grid_size + nj)
+            # Extract the solution from the response
+            solution_text = ""
             
-            # Get the raw solutions from those neighbors
-            neighbor_raw_solutions = [raw_solutions[n_idx] for n_idx in neighbor_indices]
+            # Find the first '[' that starts a list
+            start_idx = response_text.find('[')
+            if start_idx != -1:
+                # Find the matching closing ']'
+                end_idx = response_text.rfind(']')
+                if end_idx != -1 and end_idx > start_idx:
+                    solution_text = response_text[start_idx:end_idx+1]
             
-            # Evaluate score based on neighbors
-            if self.task_description == "color_consensus":
-                cell.score = self._evaluate_color_consensus(my_solution, neighbor_raw_solutions)
-            elif self.task_description == "circle_packing":
-                cell.score = self._evaluate_circle_packing(my_solution) # This is a float
-            else:
-                cell.score = 0.0
+            if not solution_text or solution_text == "[]":
+                solution_text = response_text # Store the raw response if parsing fails
+                if not solution_text:
+                    solution_text = "[]" # Default to empty list
+            
+            # Debug: Print extracted solution for first few cells
+            if idx < 3:
+                print(f"Cell {idx} extracted solution (first 200 chars): {solution_text[:200]}")
+            
+            # Evaluate the extracted solution
+            score = self.evaluate_solution(solution_text)
+            
+            # Update the cell's state
+            cell.solution = solution_text
+            cell.score = score
+            cell.conversation_history.append({
+                'role': 'user',
+                'content': "Provide an improved solution." # Simplified
+            })
+            cell.conversation_history.append({
+                'role': 'assistant',
+                'content': solution_text
+            })
 
     def run_iteration(self, num_steps: int = 1):
         """
@@ -489,16 +508,17 @@ Output ONLY one color: red, green, blue, or yellow."""
             os.makedirs(output_dir)
         
         scores = self.get_scores_grid()
+        solutions = self.get_solutions_grid()
         
         # Save scores
         scores_file = os.path.join(output_dir, f"scores_iter_{iteration}.json")
         with open(scores_file, 'w') as f:
             json.dump(scores.tolist(), f, indent=2)
             
-        # Find and save best solution (for consensus, "best" is just "a" solution)
+        # Find and save best solution
         best_idx = np.unravel_index(np.argmax(scores), scores.shape)
         best_score = scores[best_idx]
-        best_solution = self.grid[best_idx].solution
+        best_solution = solutions[best_idx]
         
         best_file = os.path.join(output_dir, f"best_solution_iter_{iteration}.json")
         with open(best_file, 'w') as f:
@@ -511,10 +531,9 @@ Output ONLY one color: red, green, blue, or yellow."""
         print(f"Outputs for iteration {iteration} saved to {output_dir}")
 
 
-def visualize_grid(scores: np.ndarray, iteration: int, output_dir: str, solutions: np.ndarray = None):
+def visualize_grid(scores: np.ndarray, iteration: int, output_dir: str):
     """
     Visualize the grid scores as a heatmap using Matplotlib.
-    If solutions are provided (for consensus task), overlay them.
     """
     if scores.size == 0:
         print("No scores to visualize.")
@@ -522,27 +541,27 @@ def visualize_grid(scores: np.ndarray, iteration: int, output_dir: str, solution
 
     plt.figure(figsize=(10, 8))
     
-    # Create a colormap for scores (e.g., 0 to 4 neighbors)
+    # Create a colormap from red (low) to green (high)
     cmap = mcolors.LinearSegmentedColormap.from_list("rg", ["#FF6B6B", "#FFF2C0", "#6BFF6B"])
-    norm = mcolors.Normalize(vmin=0, vmax=4) # For consensus task, score is 0-4
+    
+    # Handle case where all scores are the same
+    min_val = np.min(scores)
+    max_val = np.max(scores)
+    if min_val == max_val:
+        min_val = max(0, min_val - 1)
+        max_val = max_val + 1
+        
+    norm = mcolors.Normalize(vmin=min_val, vmax=max_val)
     
     plt.imshow(scores, cmap=cmap, norm=norm, interpolation='nearest')
     
-    # Add text annotations for solutions (colors)
-    if solutions is not None:
-        for i in range(scores.shape[0]):
-            for j in range(scores.shape[1]):
-                color_text = str(solutions[i, j])[:7] # Truncate
-                plt.text(j, i, f"{color_text}\n(Score: {scores[i, j]:.0f})",
-                         ha="center", va="center", color="black", fontsize=8)
-    else:
-        # Fallback for circle packing
-        for i in range(scores.shape[0]):
-            for j in range(scores.shape[1]):
-                plt.text(j, i, f"{scores[i, j]:.2f}",
-                         ha="center", va="center", color="black", fontsize=8)
+    # Add text annotations for scores
+    for i in range(scores.shape[0]):
+        for j in range(scores.shape[1]):
+            plt.text(j, i, f"{scores[i, j]:.2f}",
+                     ha="center", va="center", color="black", fontsize=8)
             
-    plt.colorbar(label="Solution Score (# of matching neighbors)")
+    plt.colorbar(label="Solution Score")
     plt.title(f"Cellular LLM Scores - Iteration {iteration}")
     plt.xlabel("Cell X-coordinate")
     plt.ylabel("Cell Y-coordinate")
@@ -562,13 +581,10 @@ def main():
         "--grid_size", type=int, default=5, help="Size of the k x k grid (default: 5)"
     )
     parser.add_argument(
-        "--iterations", type=int, default=10, help="Number of update iterations (default: 10)"
+        "--iterations", type=int, default=3, help="Number of update iterations (default: 3)"
     )
     parser.add_argument(
-        "--task", 
-        type=str, 
-        default="color_consensus", 
-        help="Task to solve (default: color_consensus)"
+        "--task", type=str, default="circle_packing", help="Task to solve (default: circle_packing)"
     )
     parser.add_argument(
         "--output_dir", type=str, default="outputs", help="Directory for outputs (default: outputs)"
@@ -590,10 +606,7 @@ def main():
         
     # Initial state (Iteration 0)
     if args.visualize:
-        visualize_grid(
-            grid.get_scores_grid(), 0, args.output_dir, 
-            solutions=grid.get_solutions_grid() if args.task == "color_consensus" else None
-        )
+        visualize_grid(grid.get_scores_grid(), 0, args.output_dir)
     grid.save_outputs(args.output_dir, 0)
     
     # Run iterations
@@ -602,10 +615,7 @@ def main():
         grid.run_iteration(num_steps=1)
         
         if args.visualize:
-            visualize_grid(
-                grid.get_scores_grid(), i + 1, args.output_dir,
-                solutions=grid.get_solutions_grid() if args.task == "color_consensus" else None
-            )
+            visualize_grid(grid.get_scores_grid(), i + 1, args.output_dir)
         grid.save_outputs(args.output_dir, i + 1)
 
     print("Simulation complete.")
